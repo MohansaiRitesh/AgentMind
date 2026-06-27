@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "agentmind": "./src/agent.py:create_agent"
+  },
+  "env": ".env"
+}
