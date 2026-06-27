@@ -1,87 +1,58 @@
-"""
-╔══════════════════════════════════════════════════════════════════╗
-║                    CONCEPT: AGENT STATE                          ║
-║                                                                  ║
-║  In LangGraph, every node in your graph shares a single          ║
-║  "state" object. Think of it as a whiteboard that every          ║
-║  agent step can read from and write to.                          ║
-║                                                                  ║
-║  State is defined as a TypedDict — a Python dict with            ║
-║  type hints for each field.                                      ║
-║                                                                  ║
-║  The key innovation: each field has an "annotation" that         ║
-║  tells LangGraph HOW to update it when multiple nodes write.     ║
-║  - add_messages: append new messages (don't overwrite)           ║
-║  - default behavior: last-write wins (overwrite)                 ║
-╚══════════════════════════════════════════════════════════════════╝
-"""
-
 from typing import Annotated, TypedDict
 from langgraph.graph.message import add_messages
+
+# Custom reducers
+def sum_tokens(current: int | None, new: int | None) -> int:
+    """A custom reducer function that adds two integers."""
+    current_val = current if current is not None else 0
+    new_val = new if new is not None else 0
+    return current_val + new_val
+
+
+def append_logs(current: list[str] | None, new: list[str] | str | None) -> list[str]:
+    """A custom reducer function to compile a running list of strings."""
+    current_logs = list(current) if current is not None else []
+    if new is None:
+        return current_logs
+    if isinstance(new, list):
+        return current_logs + new
+    return current_logs + [new]
 
 
 class AgentState(TypedDict):
     """
     The complete state of our research agent.
-    
-    This TypedDict is passed between EVERY node in the graph.
-    Each node receives the full state and returns only the keys it updates.
-    
-    WHY TypedDict?
-    - Type safety: Python can check you're not writing typos
-    - Serializable: LangGraph can save/restore this to a database
-    - Reducers: The Annotated[..., add_messages] syntax tells LangGraph
-      how to MERGE updates from parallel nodes or sequential writes
     """
     
     # ── CONVERSATION HISTORY ─────────────────────────────────────────
-    # Annotated[list, add_messages] is CRUCIAL:
-    #   - Without it: each node would OVERWRITE the message list
-    #   - With add_messages: messages are APPENDED (accumulated)
-    # This is the standard pattern for all LangGraph chat agents.
     messages: Annotated[list, add_messages]
     
     # ── AGENT METADATA ────────────────────────────────────────────────
-    # The original user query — stored separately so we never lose it
-    # even as the messages list grows with tool calls and observations
     original_query: str
-    
-    # How many tool calls have been made? Used to prevent infinite loops.
-    # If the agent calls tools 10+ times, we force it to conclude.
     tool_call_count: int
     
     # ── RESEARCH ACCUMULATION ─────────────────────────────────────────
-    # As the agent searches the web, findings are collected here.
-    # The final node reads these to write the summary report.
-    research_findings: list[str]
-    
-    # Has the agent decided it has enough info to answer?
-    # The conditional edge checks this to decide: loop again or END
+    research_findings: Annotated[list[str], append_logs]
     is_complete: bool
     
     # ── FINAL OUTPUT ──────────────────────────────────────────────────
-    # The polished final answer written by the agent
     final_report: str
+    
+    # ── ADVANCED LOGGING & METRICS & SAFETY ───────────────────────────
+    prompt_tokens: Annotated[int, sum_tokens]
+    completion_tokens: Annotated[int, sum_tokens]
+    total_tokens: Annotated[int, sum_tokens]
+    execution_logs: Annotated[list[str], append_logs]
+    is_approved: bool
 
 
 # ── DEFAULT STATE FACTORY ─────────────────────────────────────────────
 def create_initial_state(query: str) -> AgentState:
     """
     Creates the initial state for a new research session.
-    
-    We import SystemMessage and HumanMessage from langchain_core.
-    These are the building blocks of the messages list:
-    
-    - SystemMessage: Instructions to the LLM (its "personality" and rules)
-    - HumanMessage: What the user said
-    - AIMessage: What the AI responded
-    - ToolMessage: The result of a tool call
-    
-    LangGraph's add_messages reducer handles all of this automatically.
     """
-    from langchain_core.messages import HumanMessage
+    from langchain_core.messages import HumanMessage, SystemMessage
     from utils.prompts import SYSTEM_PROMPT
-    from langchain_core.messages import SystemMessage
     
     return AgentState(
         messages=[
@@ -93,4 +64,9 @@ def create_initial_state(query: str) -> AgentState:
         research_findings=[],
         is_complete=False,
         final_report="",
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
+        execution_logs=["Session initialized."],
+        is_approved=False,
     )

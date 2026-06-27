@@ -1,67 +1,52 @@
-"""
-╔══════════════════════════════════════════════════════════════════╗
-║                    CONCEPT: NODES                                ║
-║                                                                  ║
-║  A NODE is just a Python function with this signature:           ║
-║                                                                  ║
-║    def my_node(state: AgentState) -> dict:                       ║
-║        # do something with state                                 ║
-║        return {"key": new_value}  # partial state update         ║
-║                                                                  ║
-║  LangGraph automatically:                                        ║
-║    1. Passes the full current state to the node                  ║
-║    2. Takes the returned dict and MERGES it into state           ║
-║    3. Moves to the next node (based on edges)                    ║
-║                                                                  ║
-║  You DON'T return the full state — just the parts you changed.   ║
-╚══════════════════════════════════════════════════════════════════╝
-"""
-
-from langchain_core.messages import AIMessage, ToolMessage, SystemMessage
+import re
+from functools import partial
+from typing import Dict
+from langchain_core.messages import AIMessage, ToolMessage, HumanMessage, SystemMessage
+from langgraph.errors import NodeInterrupt
 from src.state import AgentState
 from utils.display import console
-import json
 
 
 # ─────────────────────────────────────────────────────────────────────
-# NODE 1: AGENT NODE
-# This is the "brain" — calls the LLM to decide what to do next.
-# The LLM can either:
-#   A) Call one or more tools (the agent's "hands")
-#   B) Produce a final answer (no tools = we're done)
+# NODE 1: RESEARCHER NODE (Hierarchical child subgraph execution)
+# ─────────────────────────────────────────────────────────────────────
+
+def researcher_node(state: AgentState, compiled_subgraph) -> dict:
+    """
+    Executes the nested researcher child subgraph.
+    """
+    topic = state.get("original_query", "")
+    if not topic and state["messages"]:
+        # Fallback to last message if original_query is missing
+        topic = state["messages"][-1].content
+
+    console.print(f"\n[bold purple]🔎 Starting researcher subgraph for topic: '{topic}'...[/bold purple]")
+    
+    # Run the child subgraph synchronously
+    subgraph_output = compiled_subgraph.invoke({"topic": topic})
+    summary = subgraph_output.get("final_summary", "No summary found.")
+    
+    console.print("[green]✓ Researcher subgraph execution finished.[/green]")
+    
+    return {
+        "research_findings": [f"Topic: {topic}\nSummary of findings:\n{summary}"],
+        "execution_logs": [f"Executed researcher subgraph for topic: '{topic}'."]
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# NODE 2: AGENT NODE (With token tracking)
 # ─────────────────────────────────────────────────────────────────────
 
 def agent_node(state: AgentState, llm_with_tools) -> dict:
     """
-    The core reasoning node.
-    
-    HOW IT WORKS:
-    1. We pass the full conversation history (state["messages"]) to the LLM
-    2. The LLM with bound tools can EITHER:
-       - Return text only → agent is done, no more tool calls
-       - Return tool_calls → agent wants to use tools
-    3. We check if tool_call_count is too high → force conclusion
-    
-    CONCEPT: Tool Binding
-    When we do `llm.bind_tools(tools)`, we're giving the LLM a
-    "menu" of tools it can call. The LLM outputs a special structured
-    JSON response like:
-    {
-      "tool_calls": [{
-        "name": "web_search",
-        "args": {"query": "latest AI news"}
-      }]
-    }
-    LangGraph then routes this to the tools_node automatically.
+    Reasoning agent node that invokes the LLM and tracks token counts.
     """
-    
     console.print(f"\n[bold purple]🧠 Agent thinking...[/bold purple]")
     
-    # Safety: if too many tool calls, force the agent to conclude
-    if state["tool_call_count"] >= 8:
+    # Force conclusion if tool call limit is reached
+    if state.get("tool_call_count", 0) >= 8:
         console.print("[yellow]⚠ Max tool calls reached, forcing conclusion[/yellow]")
-        # Inject a message telling the LLM to wrap up
-        from langchain_core.messages import HumanMessage
         messages = state["messages"] + [
             HumanMessage(content=(
                 "You have gathered enough information. "
@@ -72,126 +57,151 @@ def agent_node(state: AgentState, llm_with_tools) -> dict:
         ]
         response = llm_with_tools.invoke(messages)
     else:
-        # Normal: let the LLM decide freely
-        response = llm_with_tools.invoke(state["messages"])
+        # Construct message list: Inject research findings context right after system prompt
+        messages = []
+        if len(state["messages"]) > 0 and isinstance(state["messages"][0], SystemMessage):
+            messages.append(state["messages"][0])
+            history_start = 1
+        else:
+            history_start = 0
+            
+        if state.get("research_findings"):
+            findings_str = "\n\n".join(state["research_findings"])
+            messages.append(SystemMessage(content=(
+                f"Background context gathered from research phase:\n"
+                f"=== RESEARCH FINDINGS ===\n"
+                f"{findings_str}\n"
+                f"=========================\n"
+                f"Use the findings above to help answer the user's query."
+            )))
+            
+        messages.extend(state["messages"][history_start:])
+        response = llm_with_tools.invoke(messages)
     
-    # Debug: show what the LLM decided to do
+    # Extract token usage metadata
+    metadata = response.response_metadata.get("token_usage", {})
+    p_tokens = metadata.get("prompt_tokens", 0)
+    c_tokens = metadata.get("completion_tokens", 0)
+    t_tokens = metadata.get("total_tokens", 0)
+    
+    # Log details
     if hasattr(response, "tool_calls") and response.tool_calls:
         for tc in response.tool_calls:
             console.print(f"  [cyan]→ Calling tool:[/cyan] [bold]{tc['name']}[/bold]")
             console.print(f"    [dim]Args: {tc['args']}[/dim]")
+        log_entry = f"Agent invoked tool calls. Tokens used: prompt={p_tokens}, completion={c_tokens}, total={t_tokens}"
     else:
         console.print(f"  [green]→ Producing final answer[/green]")
-    
-    # Return only the fields we're updating
-    # LangGraph's add_messages reducer will APPEND this response
-    # to the existing messages list (not overwrite!)
+        log_entry = f"Agent generated final response. Tokens used: prompt={p_tokens}, completion={c_tokens}, total={t_tokens}"
+        
     return {
         "messages": [response],
-        "tool_call_count": state["tool_call_count"] + 1,
+        "tool_call_count": state.get("tool_call_count", 0) + 1,
+        "prompt_tokens": p_tokens,
+        "completion_tokens": c_tokens,
+        "total_tokens": t_tokens,
+        "execution_logs": [log_entry]
     }
 
 
 # ─────────────────────────────────────────────────────────────────────
-# NODE 2: TOOLS NODE
-# Executes the tools that the LLM requested.
-# 
-# CONCEPT: The ReAct Loop
-# After agent_node decides "I want to call tool X", this node:
-# 1. Finds which tools were requested (from the last AIMessage)
-# 2. Runs each tool with the provided arguments
-# 3. Wraps results in ToolMessage objects
-# 4. Adds them to the messages list
-# Then graph goes BACK to agent_node (the loop!)
+# NODE 3: VALIDATOR NODE (With NodeInterrupt safety check)
+# ─────────────────────────────────────────────────────────────────────
+
+def validator_node(state: AgentState) -> dict:
+    """
+    Dedicated validation node that intercepts tool calls and throws interrupts
+    if they exceed safety limits (e.g. calculator tool values > 1000).
+    """
+    console.print("[bold yellow]🛡️ Checking safety gates...[/bold yellow]")
+    
+    messages = state.get("messages", [])
+    if not messages:
+        return {}
+        
+    last_msg = messages[-1]
+    
+    # Check if the last message is an AI message with tool calls
+    if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
+        for tc in last_msg.tool_calls:
+            # Rule: calculator expressions shouldn't have values > 1000
+            if tc["name"] == "calculator":
+                expr = tc["args"].get("expression", "")
+                numbers = [float(n) for n in re.findall(r'\d+\.?\d*', expr)]
+                
+                if any(n > 1000 for n in numbers):
+                    # Check approval
+                    if not state.get("is_approved", False):
+                        console.print(f"  [red]CRITICAL: Safety gate triggered. Large values in calculator expression: '{expr}'[/red]")
+                        raise NodeInterrupt(
+                            f"Safety Check Required: Calculator expression '{expr}' contains values > 1000."
+                        )
+                    else:
+                        console.print("  [green]Safety rule bypassed via manual human approval.[/green]")
+                else:
+                    console.print(f"  [green]Safety check passed (Expression: {expr})[/green]")
+                    
+    return {
+        "execution_logs": ["Safety validation node executed successfully."]
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# NODE 4: TOOLS NODE
 # ─────────────────────────────────────────────────────────────────────
 
 def tools_node(state: AgentState, tools_by_name: dict) -> dict:
     """
-    Executes all tool calls requested by the last agent response.
-    
-    CONCEPT: ToolMessage
-    After a tool runs, we create a ToolMessage:
-    - tool_call_id: links back to the specific tool_call in the AIMessage
-    - content: the result of the tool
-    
-    LangChain/LangGraph requires this linking — the LLM needs to know
-    WHICH tool call produced WHICH result (especially if multiple tools
-    are called in parallel).
+    Executes tool calls requested by the agent.
     """
-    
-    # Get the last message (should be AIMessage with tool_calls)
     last_message = state["messages"][-1]
-    
     tool_messages = []
-    new_findings = list(state["research_findings"])
+    log_entries = []
     
     for tool_call in last_message.tool_calls:
         tool_name = tool_call["name"]
         tool_args = tool_call["args"]
         tool_call_id = tool_call["id"]
         
-        console.print(f"\n[bold amber]🔧 Running tool:[/bold amber] [cyan]{tool_name}[/cyan]")
+        console.print(f"\n[bold amber]🔧 Running tool:[/bold amber] [cyan]{tool_name}[/cyan] with args: {tool_args}")
         
-        # Look up the tool and run it
         if tool_name in tools_by_name:
             tool = tools_by_name[tool_name]
             try:
                 result = tool.invoke(tool_args)
                 result_str = str(result)
-                
                 console.print(f"  [green]✓ Result ({len(result_str)} chars)[/green]")
-                
-                # If this was a search, accumulate the finding
-                if tool_name == "web_search":
-                    query = tool_args.get("query", "")
-                    new_findings.append(f"[Search: {query}]\n{result_str[:500]}")
-                    
+                log_entries.append(f"Tool '{tool_name}' executed. Result: {result_str[:200]}...")
             except Exception as e:
                 result_str = f"Tool error: {str(e)}"
                 console.print(f"  [red]✗ Error: {e}[/red]")
+                log_entries.append(f"Tool '{tool_name}' failed with error: {e}")
         else:
             result_str = f"Unknown tool: {tool_name}"
-        
-        # CRITICAL: Create ToolMessage linking back to the tool_call_id
+            log_entries.append(f"Tool '{tool_name}' not found.")
+            
         tool_messages.append(
             ToolMessage(
                 content=result_str,
                 tool_call_id=tool_call_id,
             )
         )
-    
+        
     return {
-        "messages": tool_messages,  # add_messages will append these
-        "research_findings": new_findings,
+        "messages": tool_messages,
+        "execution_logs": log_entries
     }
 
 
 # ─────────────────────────────────────────────────────────────────────
-# CONDITIONAL EDGE FUNCTION
-# This is NOT a node — it's a routing function used in conditional edges.
-#
-# CONCEPT: Conditional Edges
-# After agent_node runs, LangGraph calls this function.
-# It returns a STRING that matches one of the defined edge destinations:
-#   - "use_tools"  → go to tools_node (loop continues)
-#   - "end"        → go to END (agent is done)
+# ROUTER
 # ─────────────────────────────────────────────────────────────────────
 
-def route_after_agent(state: AgentState) -> str:
+def route_after_validator(state: AgentState) -> str:
     """
-    Decides where to go after the agent_node runs.
-    
-    This function is the "brain's output decoder":
-    - If the LLM produced tool calls → run those tools
-    - If the LLM produced just text → we're done
-    
-    IMPORTANT: The return value must match a key in the
-    conditional_edges dict you pass to add_conditional_edges()
-    in the graph builder.
+    Decides routing destination based on the last AI message.
     """
     last_message = state["messages"][-1]
-    
-    # AIMessage.tool_calls is non-empty if the LLM wants to use tools
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
         console.print(f"  [dim]→ Routing to: tools_node[/dim]")
         return "use_tools"

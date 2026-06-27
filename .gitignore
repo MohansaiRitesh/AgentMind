@@ -8,11 +8,22 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
 
 # Environment variables (API keys)
 .env
+.env.local
 
 # IDE / System files
 .vscode/
 .idea/
 .DS_Store
+
+# Persistent SQLite checkpointer files
+*.db
+*.sqlite
+*.sqlite3
+
+# Local/Temporary workspaces
+scratch/
+examples/
