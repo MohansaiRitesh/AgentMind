@@ -208,3 +208,6 @@ def route_after_validator(state: AgentState) -> str:
     else:
         console.print(f"  [dim]→ Routing to: END[/dim]")
         return "end"
+
+# Backwards compatibility alias for legacy examples
+route_after_agent = route_after_validator
